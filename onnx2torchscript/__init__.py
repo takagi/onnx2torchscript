@@ -3,5 +3,6 @@ from .onnx2torchscript import (  # NOQA
     onnx_op, onnx2ts,
     MetaWarning,
     onnx_testdir_to_torchscript,
+    OnnxModule,
 )
 import onnx2torchscript.ops  # NOQA

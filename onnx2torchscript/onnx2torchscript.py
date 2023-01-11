@@ -52,7 +52,30 @@ def get_onnx_ts(
     return ret
 
 
+@torch.jit.ignore
+def _range_push(msg: str):
+    torch.cuda.nvtx.range_push(msg)
+
+
+@torch.jit.ignore
+def _range_pop():
+    torch.cuda.nvtx.range_pop()
+
+
 class OnnxModule(torch.nn.Module):
+
+    @torch.jit.script
+    def __range_push(msg: str) -> torch.Tensor:
+        print('push: ' + msg)
+        _range_push(msg)
+        return torch.empty(())  # dummy tensor to cheat the tracer
+
+    @torch.jit.script
+    def __range_pop() -> torch.Tensor:
+        print('pop')
+        _range_pop()
+        return torch.empty(())  # dummy tensor to cheat the tracer
+
     def __init__(self, model: onnx.ModelProto) -> None:
         super().__init__()
         self.model = model
@@ -165,12 +188,25 @@ class OnnxModule(torch.nn.Module):
                 msg = f"{o_n.domain}::{o_n.op_type}-{self.opset(o_n.domain)} not found"
                 raise NotImplementedError(msg)
             t_sch = t_s.schema
+
             ins = [None if n == '' else values[self.escape_buffer_name(n)] for n in o_n.input]
+            # ins = []
+            # for n in o_n.input:
+            #     if n == '':
+            #         ins.append(None)
+            #     else:
+            #         if o_n.name == 'Gather_887':
+            #             if n == 'model.1991':
+            #                 n = 'model.1991.gpu'
+            #             print(('append', n))
+            #         ins.append(values[self.escape_buffer_name(n)])
+
             if o_sch is not None and len(o_sch.inputs) == 1 and o_sch.inputs[0].option == Variadic:
                 ins = [ins]
             for idx in range(len(ins), len(t_sch.arguments)):
                 arg = t_sch.arguments[idx]
                 if arg.name in o_attr_vals:
+#                    print(('arg.name', arg.name))
                     ins.append(o_attr_vals[arg.name])
                 elif arg.has_default_value():
                     if arg.name == "_num_outputs":
@@ -179,7 +215,9 @@ class OnnxModule(torch.nn.Module):
                     ins.append(arg.default_value)
                 else:
                     raise RuntimeError(f"{arg.name} not provided")
+            self.__range_push(o_n.name)
             outs = t_s(*ins)
+            self.__range_pop()
             if not isinstance(outs, (tuple, list)):
                 outs = (outs,)
 
@@ -198,6 +236,25 @@ class OnnxModule(torch.nn.Module):
                 else:
                     raise RuntimeError(f"Cannot supply outputs: {o_n.output[len(outs):]}")
 
+            # if o_n.name == 'Constant_0':
+            #     self.__range_push('Constant_0_gpu')
+            #     assert len(ins) == 1
+            #     #ins[0] = ins[0].to('cuda')
+            #     ins[0] = getattr(self, 'Constant_0_model_1991_value_gpu')
+            #     outs = t_s(*ins)
+            #     self.__range_pop()
+            #     if not isinstance(outs, (tuple, list)):
+            #         outs = (outs,)
+            #     if len(outs) >= len(o_n.output):
+            #         for n, o in zip(o_n.output, outs):
+            #             assert n == 'model.1991'
+            #             n = 'model.1991.gpu'
+            #             n = self.escape_buffer_name(n)
+            #             assert n not in values
+            #             values[n] = o
+            #     else:
+            #         assert False
+
         ret = tuple([values[i.name] for i in self.model.graph.output])
         if len(ret) == 1:
             return ret[0]
@@ -208,6 +265,16 @@ def onnx2ts(
     model: onnx.ModelProto, args: Any, verbose: bool = False
 ) -> torch._C.ScriptModule:
     m = OnnxModule(model)
+    
+    # for k, v in m.state_dict().items():
+    #     if v.dtype == torch.int64:
+    #         if k == 'Constant_0_model_1991_value':
+    #             k = 'Constant_0_model_1991_value_gpu'
+    #             #setattr(m, k, v.to('cuda'))
+    #             setattr(m, k, v.clone().detach())
+    #     else:
+    #         setattr(m, k, v.to('cuda'))
+
     try:
         meta_args = tuple(a.to('meta') for a in args)
         m.enable_meta_mode(True)
@@ -219,8 +286,61 @@ def onnx2ts(
         warnings.warn(f"Failed meta tracing mode, fallbacking: {e}", MetaWarning)
         m.enable_meta_mode(False)
         t = torch.jit.trace(m, args, check_trace=False)
-
+    #     for k, v in m.original_params.items():
+    #         if k == 'Constant_0_model_1991_value':
+    #             k = 'Constant_0_model_1991_value_gpu'
+    #             setattr(t, k, v.clone().detach())
+    # assert getattr(t, 'Constant_0_model_1991_value_gpu') is not None
     return t
+
+
+def _tweak_onnx_model(m: onnx.ModelProto):
+    g = m.graph
+    ns = g.node
+
+    # Duplicate and insert Constants as their GPU versions
+    constants_to_duplicate = [
+        ('Constant_0', 'model.1991'),
+        ('Constant_1', 'model.1995'),
+        ('Constant_3', 'model.1997'),
+        ('Constant_7', 'model.2005'),
+    ]
+    for name, output in constants_to_duplicate:
+        for i, n in enumerate(ns):
+            if n.name == name:
+                assert len(n.output) == 1
+                assert n.output[0] == output
+                n_gpu = onnx.helper.make_node(
+                    op_type=n.op_type,
+                    inputs=n.input,
+                    outputs=[output + '.gpu'],
+                    name=n.name + '_gpu',
+                    doc_string=n.doc_string,
+                    domain=n.domain,
+                    value=onnx.helper.get_attribute_value(n.attribute[0]),
+                )
+                ns.insert(i + 1, n_gpu)
+                print(n.name + '_gpu')
+                break
+
+    # Replace Gathers' second inputs with Constants' GPU versions
+    gathers_to_replace = [
+        'Gather_887',
+        'Gather_900',
+        'Gather_1417',
+        'Gather_1430',
+        'Gather_1947',
+        'Gather_1960',
+        'Gather_2477',
+        'Gather_2489',
+    ]
+    for n in ns:
+        if n.name in gathers_to_replace:
+            n.input[1] = n.input[1] + '.gpu'
+            print(n.input[1])
+
+
+
 
 
 def onnx_testdir_to_torchscript(test_dir: str) -> Tuple[torch._C.ScriptModule, List[Tuple[List[torch.Tensor], List[torch.Tensor]]]]:
@@ -230,6 +350,9 @@ def onnx_testdir_to_torchscript(test_dir: str) -> Tuple[torch._C.ScriptModule, L
     cases = glob.glob(os.path.join(test_dir, "test_data_set_*"))
     ret: List[Tuple[List[torch.Tensor], List[torch.Tensor]]] = []
     m = onnx.load_model(model_path)
+
+    _tweak_onnx_model(m)
+
     for c in cases:
         input_files = glob.glob(os.path.join(c, "input_*.pb"))
         in_dict: Dict[str, torch.Tensor] = {}
@@ -238,9 +361,14 @@ def onnx_testdir_to_torchscript(test_dir: str) -> Tuple[torch._C.ScriptModule, L
                 p = onnx.TensorProto()
                 p.ParseFromString(f.read())
                 in_dict[p.name] = torch.from_numpy(onnx.numpy_helper.to_array(p).copy())
+#                in_dict["Input3"] = torch.from_numpy(onnx.numpy_helper.to_array(p).copy())
+#                in_dict["gpu_0/data_0"] = torch.from_numpy(onnx.numpy_helper.to_array(p).copy())
+#                print(in_dict["Input3"].shape)
         ins: List[torch.Tensor] = []
+        initializer_names: Set[str] = set(i.name for i in m.graph.initializer)
         for i in m.graph.input:
-            ins.append(in_dict[i.name])
+            if i.name not in initializer_names:
+                ins.append(in_dict[i.name])
         output_files = glob.glob(os.path.join(c, "output_*.pb"))
         out_dict: Dict[str, torch.Tensor] = {}
         for i in output_files:
@@ -248,8 +376,11 @@ def onnx_testdir_to_torchscript(test_dir: str) -> Tuple[torch._C.ScriptModule, L
                 p = onnx.TensorProto()
                 p.ParseFromString(f.read())
                 out_dict[p.name] = torch.from_numpy(onnx.numpy_helper.to_array(p).copy())
+#                out_dict["Plus214_Output_0"] = torch.from_numpy(onnx.numpy_helper.to_array(p).copy())
+#                out_dict["gpu_0/softmax_1"] = torch.from_numpy(onnx.numpy_helper.to_array(p).copy())
         outs: List[torch.Tensor] = []
         for i in m.graph.output:
+#            print(i.name)
             outs.append(out_dict[i.name])
         ret.append((ins, outs))
     assert len(ret) >= 1

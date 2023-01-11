@@ -10,6 +10,40 @@ import onnx
 import pytorch_pfn_extras as ppe
 
 
+@torch.jit.ignore
+def _print_tensor_data_ptr(x: Tensor):
+    #print((type(x), x.data_ptr()))
+    pass
+
+
+@torch.jit.ignore
+def _print_tensor_data_ptr2(x: Tensor):
+    print((type(x), x.data_ptr(), x.shape, x.dtype))
+
+
+@torch.jit.ignore
+def _breakpoint():
+    breakpoint()
+
+
+@torch.jit.ignore
+def _print_tensor_data_ptrs(xs: List[Tensor]):
+    print('--')
+    for x in xs:
+        _print_tensor_data_ptr2(x)
+    print('--')
+
+
+@torch.jit.ignore
+def _range_push(msg: str):
+    torch.cuda.nvtx.range_push(msg)
+
+
+@torch.jit.ignore
+def _range_pop():
+    torch.cuda.nvtx.range_pop()
+
+
 binary_ops: Dict[str, Callable] = {
     "Add-1": torch.add,
     "And-1": torch.logical_and,
@@ -32,7 +66,22 @@ for k, o in binary_ops.items():
     op_type, ver = k.split('-')
     @onnx_op(op_type, int(ver))
     def op(x: Tensor, y: Tensor) -> Tensor:
-        return o(x, y)
+        _range_push('binop')
+
+        _print_tensor_data_ptr2(x)
+        _print_tensor_data_ptr2(y)
+        '''
+        if (x.device != y.device):
+            print('binary_ops')
+            if (x.device == 'cpu'):
+                x = x.to('cuda:0')
+            elif (y.device == 'cpu'):
+                y = y.to('cuda:0')
+        '''
+        ret = o(x, y)
+        _range_pop()
+        return ret
+        #return o(x, y)
     op.__nmae__ = f"op_{op_type}_{ver}"
 
 unary_ops: Dict[str, Callable] = {
@@ -70,7 +119,11 @@ for k, o in unary_ops.items():
     op_type, ver = k.split('-')
     @onnx_op(op_type, int(ver))
     def op(x: Tensor) -> Tensor:
-        return o(x)
+        _range_push('unop')
+        ret = o(x)
+        _range_pop()
+        return ret
+        #return o(x)
     op.__nmae__ = f"op_{op_type}_{ver}"
 
 
@@ -80,14 +133,23 @@ def op_Gemm(
     # *,  # Commenting out due to kwargs unsupported in trace mode
     alpha: float = 1.0, beta: float = 1.0, transA: int = 0, transB: int = 0
 ) -> Tensor:
+    _range_push('Gemm')
     if transA:
         a = a.swapaxes(-1, -2)
     if transB:
         b = b.swapaxes(-1, -2)
     if c is not None:
-        return torch.addmm(c, a, b, beta=beta, alpha=alpha)
+        ret = torch.addmm(c, a, b, beta=beta, alpha=alpha)
+        _range_pop()
+        return ret
     else:
-        return torch.mm(a, b) * alpha
+        ret = torch.mm(a, b) * alpha
+        _range_pop()
+        return ret
+    # if c is not None:
+    #     return torch.addmm(c, a, b, beta=beta, alpha=alpha)
+    # else:
+    #     return torch.mm(a, b) * alpha
 
 
 @onnx_op("Constant", 1)
@@ -95,7 +157,10 @@ def op_Constant(
     # *,
     value: Tensor
 ) -> Tensor:
-    return value
+    _range_push('Constant')
+    ret = value
+    _range_pop()
+    return ret
 
 
 @onnx_op("Conv", 1)
@@ -105,18 +170,22 @@ def op_Conv(
     dilations: Optional[List[int]] = None,  group: int = 1, kernel_shape: Optional[List[int]] = None,
     pads: Optional[List[int]] = None, strides: Optional[List[int]] = None,
 ) -> Tensor:
+    _range_push('Conv')
     if dilations is None:
         dilations = [1]
     if strides is None:
         strides = [1]
     if pads is None:
         pads = [0]
+#        pads = [k // 2 for k in w.shape[2:]]  # SAME_UPPER
     elif all([p == pads[0] for p in pads]):
         pads = [pads[0]]
-    return torch.convolution(
+    ret = torch.convolution(
         x, w, b,
         stride=strides, padding=pads, dilation=dilations, groups=group, 
         transposed=False, output_padding=[0])
+    _range_pop()
+    return ret
 
 
 @onnx_op("ConvTranspose", 1)
@@ -127,6 +196,7 @@ def op_ConvTranspose(
     pads: Optional[List[int]] = None, strides: Optional[List[int]] = None,
     output_padding: Optional[List[int]] = None,
 ) -> Tensor:
+    _range_push('ConvTranspose')
     if dilations is None:
         dilations = [1]
     if strides is None:
@@ -137,10 +207,12 @@ def op_ConvTranspose(
         pads = [pads[0]]
     if output_padding is None:
         output_padding = [0]
-    return torch.convolution(
+    ret = torch.convolution(
         x, w, b,
         stride=strides, padding=pads, dilation=dilations, groups=group, 
         transposed=True, output_padding=output_padding)
+    _range_pop()
+    return ret
 
 
 @onnx_op("BatchNormalization", 1)
@@ -150,9 +222,12 @@ def op_BatchNorm(
     # *,
     epsilon: float = 1e-05, momentum: float = 0.9, training_mode: int = 0,
 ) -> Tuple[Tensor, Tensor, Tensor]:
-    return torch.native_batch_norm(
+    _range_push('BatchNorm')
+    ret = torch.native_batch_norm(
         x, scale, b, input_mean, input_var, 
         training=training_mode != 0, momentum=momentum, eps=epsilon)
+    _range_pop()
+    return ret
 
 
 @onnx_op("Softmax", 1)
@@ -161,7 +236,10 @@ def op_Softmax(
     # *,
     axis: int = -1
 ) -> Tensor:
-    return torch.softmax(x, dim=axis)
+    _range_push('Softmax')
+    ret = torch.softmax(x, dim=axis)
+    _range_pop()
+    return ret
 
 
 @onnx_op("LogSoftmax", 1)
@@ -170,7 +248,10 @@ def op_LogSoftmax(
     # *,
     axis: int = -1
 ) -> Tensor:
-    return torch.log_softmax(x, dim=axis)
+    _range_push('LogSoftmax')
+    ret = torch.log_softmax(x, dim=axis)
+    _range_pop()
+    return ret
 
 
 @onnx_op("Trilu", 14)
@@ -180,17 +261,31 @@ def op_Trilu(
     # *,
     upper: int = 1
 ) -> Tensor:
+    _range_push('Trilu')
     if k is None:
         k = torch.scalar_tensor(0)
     if upper:
-        return torch.triu(input, diagonal=k.item())
+        ret = torch.triu(input, diagonal=k.item())
     else:
-        return torch.tril(input, diagonal=k.item())
+        ret = torch.tril(input, diagonal=k.item())
+    _range_pop()
+    return ret
 
 
 @onnx_op("Where", 9)
 def op_Where(cond: Tensor, x: Tensor, y: Tensor) -> Tensor:
-    return torch.where(cond != 0, x, y)
+    _range_push('Where')
+    if x.device != y.device:
+        print('op_Where')
+        _print_tensor_data_ptr2(x)
+        _print_tensor_data_ptr2(y)
+        if x.device == 'cpu':
+            x = x.to('cuda')
+        else:
+            y = y.to('cuda')
+    ret = torch.where(cond != 0, x, y)
+    _range_pop()
+    return ret
 
 
 @onnx_op("TopK", 1)
@@ -199,8 +294,10 @@ def op_TopK(
     # *,
     axis: int = -1, largest: int = 1, sorted: int = 1,
 ) -> Tuple[Tensor, Tensor]:
-    return torch.topk(x, k.item(), dim=axis, largest=largest != 0, sorted=sorted != 0)
-
+    _range_push('TopK')
+    ret = torch.topk(x, k.item(), dim=axis, largest=largest != 0, sorted=sorted != 0)
+    _range_pop()
+    return ret
 
 OnnxAny = Union[Tensor, List[Tensor], Optional[Tensor]]
 
@@ -215,7 +312,10 @@ def op_Reshape(
     # *,
     allowzero: int = 0
 ) -> Tensor:
-    return torch.reshape(data, annotate(List[int], shape.tolist()))
+    _range_push('Reshape')
+    ret = torch.reshape(data, annotate(List[int], shape.tolist()))
+    _range_pop()
+    return ret
 
 
 @onnx_op("BitShift", 11)
@@ -224,11 +324,14 @@ def op_BitShift(
     # *,
     direction: str,
 ) -> Tensor:
+    _range_push('BitShift')
     if direction == "LEFT":
-        return torch.bitwise_left_shift(x, y)
+        ret = torch.bitwise_left_shift(x, y)
     else:
         assert direction == "RIGHT"
-        return torch.bitwise_right_shift(x, y)
+        ret = torch.bitwise_right_shift(x, y)
+    _range_pop()
+    return ret
 
 
 @onnx_op("Shape", 1)
@@ -237,10 +340,14 @@ def op_Shape(
     # *,
     end: Optional[int] = None, start: int = 0,
 ) -> Tensor:
+    _range_push('Shape')
     s = data.shape
     if end is None:
         end = len(s)
-    return torch.tensor(s[start:end], device=data.device)
+#    ret = torch.tensor(s[start:end], device=data.device)
+    ret = torch.tensor(s[start:end])
+    _range_pop()
+    return ret
 
 
 @onnx_op("Transpose", 1)
@@ -249,11 +356,16 @@ def op_Transpose(
     # *,
     perm: Optional[List[int]] = None,
 ) -> Tensor:
+    _range_push('Transpose')
     if perm is None:
         l = list(range(data.dim()))
         l.reverse()
-        return data.permute(l)
-    return torch.permute(data, perm)
+        ret = data.permute(l)
+        _range_pop()
+        return ret
+    ret = torch.permute(data, perm)
+    _range_pop()
+    return ret
 
 
 @onnx_op("Tile", 1)
@@ -300,9 +412,11 @@ def op_Einsum(
 
 @onnx_op("Max", 1)
 def op_Max(inputs: List[Tensor]) -> Tensor:
+    _range_push('Max')
     ret = inputs[0]
     for i in inputs[1:]:
         ret = torch.maximum(ret, i)
+    _range_pop()
     return ret
 
 
@@ -448,16 +562,23 @@ def op_ReduceSum_13(
     keepdims: int = 1,
     noop_with_empty_axes: int = 0,
 ) -> Tensor:
+    _range_push('ReduceSum')
     if axes is None:
         ret = torch.sum(data)
         if keepdims != 0:
-            return torch.reshape(ret, [1] * data.dim())
+            ret = torch.reshape(ret, [1] * data.dim())
+            _range_pop()
+            return ret
         else:
+            _range_pop()
             return ret
     else:
         if axes.numel() == 0 and noop_with_empty_axes != 0:
+            _range_pop()
             return data
-        return torch.sum(data, dim=annotate(List[int], axes.tolist()), keepdim=keepdims != 0)
+        ret = torch.sum(data, dim=annotate(List[int], axes.tolist()), keepdim=keepdims != 0)
+        _range_pop()
+        return ret
 
 
 @onnx_op("ReduceLogSum", 1)
@@ -553,17 +674,56 @@ def op_Clip_11(input: Tensor, min: Optional[Tensor] = None, max: Optional[Tensor
     return input
 
 
+# def foo(x):
+#     torch.cuda.nvtx.range_push('foo')
+#     print(torch.cuda.current_device())
+#     torch.cuda.set_device(1)
+#     return x
+
+# breakpoint()
+
+# tr_foo = torch.jit.trace(foo, (torch.tensor([1]),))
+
+# breakpoint()
+
+# import torch.utils.cpp_extension
+# torch.utils.cpp_extension.load(
+#     name='my_cat',
+#     sources=['my_cat.cc'],
+#     is_python_module=False,
+#     verbose=True)
+
 @onnx_op("Concat", 1)
 def op_Concat(
     inputs: List[Tensor],
     # *,
     axis: int,
 ) -> Tensor:
-    return torch.concat(inputs, dim=axis)
+    _range_push('Concat')
+    _print_tensor_data_ptrs(inputs)
+
+    
+
+
+    # if len(inputs) == 3 and inputs[0].device == 'cpu' and inputs[2].device == 'cuda:0':
+    #     print('op_Concat')
+    #     inputs[2] = inputs[2].to('cpu')
+    # elif len(inputs) == 4 and inputs[3].device == 'cuda:0':
+    #     print('op_Concat')
+    #     inputs[3] = inputs[3].to('cpu')
+    # elif len(inputs) == 2 and inputs[1].device == 'cuda:0' and inputs[0].device == 'cpu':
+    #     print('op_Concat')
+    #     inputs[1] = inputs[1].to('cpu')
+
+    ret = torch.concat(inputs, dim=axis)
+    _range_pop()
+    return ret
+    #return torch.concat(inputs, dim=axis)
 
 
 @onnx_op("Squeeze", 13)
 def op_Squeeze_13(data: Tensor, axes: Optional[Tensor] = None) -> Tensor:
+    _range_push('Squeeze')
     if axes is None:
         return torch.squeeze(data)
     axes_list = annotate(List[int], axes.tolist())
@@ -572,7 +732,9 @@ def op_Squeeze_13(data: Tensor, axes: Optional[Tensor] = None) -> Tensor:
     for a in sorted(axes_list):
         assert s[a] == 1
         del s[a]
-    return torch.reshape(data, s)
+    ret = torch.reshape(data, s)
+    _range_pop()
+    return ret
 
 
 @onnx_op("Squeeze", 1)
@@ -594,11 +756,13 @@ def op_Squeeze_1(
 
 @onnx_op("Unsqueeze", 13)
 def op_Unsqueeze_13(data: Tensor, axes: Tensor) -> Tensor:
+    _range_push('Unsqueeze')
     axes_list = annotate(List[int], axes.tolist())
     axes_list = [a if a >= 0 else a + data.dim() for a in axes_list]
     ret = data
     for a in sorted(axes_list):
         ret = torch.unsqueeze(ret, dim=a)
+    _range_pop()
     return ret
 
 
@@ -608,10 +772,12 @@ def op_Unsqueeze_1(
     # *,
     axes: List[int],
 ) -> Tensor:
+    _range_push('Unsqueeze')
     axes_list = [a if a >= 0 else a + data.dim() for a in axes]
     ret = data
     for a in sorted(axes_list):
         ret = torch.unsqueeze(ret, dim=a)
+    _range_pop()
     return ret
 
 
@@ -621,6 +787,7 @@ def op_Cast(
     # *,
     to: int,
 ) -> Tensor:
+    _range_push('Cast')
     _to_torch_dtype: Dict[int, torch.dtype] = {
         1: torch.float,
         2: torch.uint8,
@@ -631,7 +798,9 @@ def op_Cast(
         11: torch.double,
         9: torch.bool,
     }
-    return  input.to(_to_torch_dtype[to])
+    ret = input.to(_to_torch_dtype[to])
+    _range_pop()
+    return ret
 
 
 @onnx_op("Compress", 9)
@@ -772,11 +941,18 @@ def op_MaxPool(
             return_indices=True,
             ceil_mode=ceil_mode != 0)
     elif len(kernel_shape) == 2:
-        return torch.nn.functional.max_pool2d(
+        ret = torch.nn.functional.max_pool2d(
             x, kernel_shape, stride=strides, padding=pads,
             dilation=dilations,
             return_indices=True,
             ceil_mode=ceil_mode != 0)
+        print((x.shape, ret[0].shape))
+        return ret
+        # return torch.nn.functional.max_pool2d(
+        #     x, kernel_shape, stride=strides, padding=pads,
+        #     dilation=dilations,
+        #     return_indices=True,
+        #     ceil_mode=ceil_mode != 0)
     else:
         assert len(kernel_shape) == 3
         return torch.nn.functional.max_pool3d(
@@ -823,9 +999,12 @@ def op_ConstantOfShape(
     # *,
     value: Optional[Tensor] = None
 ) -> Tensor:
+    _range_push('ConstantOfShape')
     if value is None:
         value = torch.scalar_tensor(0.0)
-    return value.expand(annotate(List[int], input.tolist()))
+    ret = value.expand(annotate(List[int], input.tolist()))
+    _range_pop()
+    return ret
 
 
 @onnx_op("CumSum", 11)
@@ -854,7 +1033,10 @@ def op_InstanceNormalization(
 
 @onnx_op("Softplus", 1)
 def op_Softplus(x: Tensor) -> Tensor:
-    return torch.log(torch.exp(x) + 1)
+    _range_push('Softplus')
+    ret = torch.log(torch.exp(x) + 1)
+    _range_pop()
+    return ret
 
 
 @onnx_op("CastLike", 15)
@@ -899,6 +1081,13 @@ def op_HardSwish(x: Tensor) -> Tensor:
 
 @onnx_op("Expand", 1)
 def op_Expannd(input: Tensor, shape: Tensor) -> Tensor:
+    _range_push('Expand')
+
+    if shape.device == 'cuda:0':
+        print('op_Expannd')
+        _print_tensor_data_ptr2(shape)
+        shape = shape.to('cpu')
+
     t = annotate(List[int], shape.tolist())
     f = input.shape
 
@@ -909,7 +1098,9 @@ def op_Expannd(input: Tensor, shape: Tensor) -> Tensor:
     for idx in range(len(f)):
         ex.append(max(f[idx], t[idx - offset] if idx >= offset else 1))
 
-    return input.expand(ex)
+    ret = input.expand(ex)
+    _range_pop()
+    return ret
 
 
 @onnx_op("Split", 13)
@@ -919,12 +1110,17 @@ def op_Split_13(
     axis: int = 0, num_outputs: Optional[int] = None,
     _num_outputs: int = 0,  # Special argument name
 ) -> List[Tensor]:
+    _range_push('Split')
     if split is None:
         if num_outputs is None:
             num_outputs = _num_outputs
-        return torch.split(input, int(ceil(input.size(axis) / num_outputs)), dim=axis)
+        ret = torch.split(input, int(ceil(input.size(axis) / num_outputs)), dim=axis)
+        _range_pop()
+        return ret
     else:
-        return torch.split(input, annotate(List[int], split.tolist()), dim=axis)
+        ret = torch.split(input, annotate(List[int], split.tolist()), dim=axis)
+        _range_pop()
+        return ret
 
 
 @onnx_op("Split", 1)
@@ -979,7 +1175,10 @@ def op_Softsign(x: Tensor) -> Tensor:
 
 @onnx_op("NonZero", 9)
 def op_NonZero(x: Tensor) -> Tensor:
-    return torch.nonzero(x).transpose(0, 1)
+    _range_push('NonZero')
+    ret = torch.nonzero(x).transpose(0, 1)
+    _range_pop()
+    return ret
 
 
 @onnx_op("SplitToSequence", 11)
@@ -1017,6 +1216,7 @@ def op_Slice_10(
     data: Tensor, starts: Tensor, ends: Tensor,
     axes: Optional[Tensor] = None, steps: Optional[Tensor] = None,
 ) -> Tensor:
+    _range_push('Slice')
     axes_list: List[int] = []
     assert starts.numel() == ends.numel()
     if axes is None:
@@ -1049,6 +1249,7 @@ def op_Slice_10(
             step = -step
         idx = torch.arange(s, e, step, device=data.device)
         ret = torch.index_select(ret, dim=a, index=idx)
+    _range_pop()
     return ret
 
 
@@ -1069,9 +1270,12 @@ if ppe.requires("1.12"):
         # *,
         axis: int = 0, reduction: Optional[str] = None,
     ) -> Tensor:
+        _range_push('ScatterElements')
         indices = torch.where(indices < 0, indices + data.size(axis), indices)
         if reduction is None or reduction == "none":
-            return torch.scatter(data, dim=axis, index=indices, src=updates)
+            ret = torch.scatter(data, dim=axis, index=indices, src=updates)
+            _range_pop()
+            return ret
 
         if reduction == "add":
             reduction = "sum"
@@ -1084,8 +1288,10 @@ if ppe.requires("1.12"):
         else:
             assert reduction == "min"
             reduction = "amin"
-        return torch.scatter_reduce(
+        ret = torch.scatter_reduce(
             data, dim=axis, index=indices, src=updates, reduce=reduction)
+        _range_pop()
+        return ret
 else:
     @onnx_op("ScatterElements", 11)
     def op_ScatterElements(
@@ -1093,17 +1299,22 @@ else:
         # *,
         axis: int = 0, reduction: Optional[str] = None,
     ) -> Tensor:
+        _range_push('ScatterElements')
         indices = torch.where(indices < 0, indices + data.size(axis), indices)
         if reduction is None or reduction == "none":
-            return torch.scatter(data, dim=axis, index=indices, src=updates)
+            ret = torch.scatter(data, dim=axis, index=indices, src=updates)
+            _range_pop()
+            return ret
         elif reduction == "add":
             reduction = "add"
         else:
             assert reduction == "mul"
             reduction = "multiply"
-        return torch.scatter(
+        ret = torch.scatter(
             data, dim=axis, index=indices, src=updates,
             reduce=reduction)
+        _range_pop()
+        return ret
 
 
 @onnx_op("Scatter", 9)
@@ -1239,7 +1450,80 @@ def op_Gather(
     # *,
     axis: int = 0,
 ) -> Tensor:
+    _range_push('Gather')
+
+    #_print_tensor_data_ptr(indices)
+    #print((data.device, indices.device))
+
+
+    if data.device == 'cuda:0' and indices.device == 'cpu':
+        #_breakpoint()
+        print('op_Gather')
+        _print_tensor_data_ptr2(indices)
+        indices = indices.to('cuda')
+    elif data.device == 'cpu' and indices.device == 'cuda:0':
+        print('op_Gather2')
+        _print_tensor_data_ptr2(indices)
+        indices = indices.to('cpu')
+
     positive_indices = resolve_negative_indices(data, indices, axis)
     indices_collapsed = positive_indices.reshape(indices.numel())
     shape = data.shape[0:axis] + indices.shape + data.shape[axis + 1:]
-    return data.index_select(dim=axis, index=indices_collapsed).reshape(shape)
+
+    ret = data.index_select(dim=axis, index=indices_collapsed).reshape(shape)
+    _range_pop()
+    return ret
+
+
+@onnx_op("ChainerTeaNetGatherMulSum", 13)
+def op_ChainerTeaNetGatherMulSum(x: Tensor, i: Tensor, f: Tensor) -> Tensor:
+    _range_push('ChainerTeaNetGatherMulSum')
+    ret = (x.index_select(dim=0, index=i) * f.unsqueeze(dim=1)).sum(dim=2)
+    _range_pop()
+    return ret
+
+
+@onnx_op("ChainerScatterAdd", 1)
+def op_ChainerScatterAdd(
+    data: Tensor, indices: Tensor, updates: Tensor,
+    # *,
+    axis: int,
+) -> Tensor:
+    _range_push('ChainerScatterAdd')
+    ret = data.scatter_add(dim=axis, index=indices.to(torch.long), src=updates)
+    _range_pop()
+    return ret
+
+
+def index_add_by_scatter(x: Tensor, i: Tensor, a: Tensor) -> Tensor:
+    shape = i.shape + (1,) * (x.ndim - 1)
+    i_ = i.view(shape).expand(a.shape)
+    return x.scatter_add(0, i_, a)
+
+
+@onnx_op("ChainerTeaNetMulIndexAddSub", 13)
+def op_ChainerTeaNetMulIndexAddSub(x: Tensor, y: Tensor, i: Tensor, j: Tensor, f: Tensor) -> Tensor:
+    _range_push('ChainerTeaNetMulIndexAddSub')
+    z = y * f
+    r = -index_add_by_scatter(x, j, z)
+    ret = index_add_by_scatter(r, i, z)
+    _range_pop()
+    return ret
+
+
+@onnx_op("ChainerTeaNetMulIndexAddAdd", 13)
+def op_ChainerTeaNetMulIndexAddAdd(x: Tensor, y: Tensor, i: Tensor, j: Tensor, f: Tensor) -> Tensor:
+    _range_push('ChainerTeaNetMulIndexAddAdd')
+    z = y * f
+    r = index_add_by_scatter(x, i, z)
+    ret = index_add_by_scatter(r, j, z)
+    _range_pop()
+    return ret
+
+
+@onnx_op("ChainerDetach", 1)
+def op_ChainerDetach(input: Tensor) -> Tensor:
+    _range_push('ChainerDetach')
+    ret = input.detach()
+    _range_pop()
+    return ret
