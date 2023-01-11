@@ -33,22 +33,12 @@ def main(argv: List[str]) -> None:
         for e_o, a_o in zip(outputs, actual_outs):
             a_o = a_o.to('cpu')
             d = (e_o - a_o).abs() / a_o.abs()
-            foo = (d > 1e-2).sum()
-            print(a_o.shape)
-            print(foo)
-            print(d)
-            print((e_o[-1], a_o[-1], (e_o-a_o)[-1]))
-            #print((d.max(), d.min(), d.mean()))
-
-            
-
             print('max {:.3e}, min {:.3e}, absmin {:.3e}, mean {:.3e}, absmean {:.3e}, std {:.3e}'.format(
                 e_o.max().item(), e_o.min().item(), e_o.abs().min().item(),
                 e_o.mean().item(), e_o.abs().mean().item(), e_o.std().item()))
             print('max {:.3e}, min {:.3e}, absmin {:.3e}, mean {:.3e}, absmean {:.3e}, std {:.3e}'.format(
                 a_o.max().item(), a_o.min().item(), a_o.abs().min().item(),
                 a_o.mean().item(), a_o.abs().mean().item(), a_o.std().item()))
-
             #assert torch.allclose(e_o, a_o)
 
 
