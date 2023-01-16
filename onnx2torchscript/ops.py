@@ -240,7 +240,7 @@ def op_Shape(
     s = data.shape
     if end is None:
         end = len(s)
-    return torch.tensor(s[start:end], device=data.device)
+    return torch.tensor(s[start:end])
 
 
 @onnx_op("Transpose", 1)
@@ -1295,4 +1295,43 @@ def op_Gather(
 @onnx_op("OptionalGetElement", 15)
 def op_OptionalGetElement(input: Optional[OnnxAny]) -> OnnxAny:
     assert input is not None
-    return input
+    return 
+
+
+@onnx_op("ChainerTeaNetGatherMulSum", 13)
+def op_ChainerTeaNetGatherMulSum(x: Tensor, i: Tensor, f: Tensor) -> Tensor:
+    return (x.index_select(dim=0, index=i) * f.unsqueeze(dim=1)).sum(dim=2)
+
+
+@onnx_op("ChainerScatterAdd", 1)
+def op_ChainerScatterAdd(
+    data: Tensor, indices: Tensor, updates: Tensor,
+    # *,
+    axis: int,
+) -> Tensor:
+    return data.scatter_add(dim=axis, index=indices.to(torch.long), src=updates)
+
+
+def index_add_by_scatter(x: Tensor, i: Tensor, a: Tensor) -> Tensor:
+    shape = i.shape + (1,) * (x.ndim - 1)
+    i_ = i.view(shape).expand(a.shape)
+    return x.scatter_add(0, i_, a)
+
+
+@onnx_op("ChainerTeaNetMulIndexAddSub", 13)
+def op_ChainerTeaNetMulIndexAddSub(x: Tensor, y: Tensor, i: Tensor, j: Tensor, f: Tensor) -> Tensor:
+    z = y * f
+    r = -index_add_by_scatter(x, j, z)
+    return index_add_by_scatter(r, i, z)
+
+
+@onnx_op("ChainerTeaNetMulIndexAddAdd", 13)
+def op_ChainerTeaNetMulIndexAddAdd(x: Tensor, y: Tensor, i: Tensor, j: Tensor, f: Tensor) -> Tensor:
+    z = y * f
+    r = index_add_by_scatter(x, i, z)
+    return index_add_by_scatter(r, j, z)
+
+
+@onnx_op("ChainerDetach", 1)
+def op_ChainerDetach(input: Tensor) -> Tensor:
+    return input.detach()

@@ -232,6 +232,52 @@ def onnx2ts(
     return t
 
 
+def _tweak_onnx_model(m: onnx.ModelProto):
+    g = m.graph
+    ns = g.node
+
+    print('Duplicate and insert Constants as their GPU versions...')
+    constants_to_duplicate = [
+        ('Constant_0', 'model.1991'),
+        ('Constant_1', 'model.1995'),
+        ('Constant_3', 'model.1997'),
+        ('Constant_7', 'model.2005'),
+    ]
+    for name, output in constants_to_duplicate:
+        for i, n in enumerate(ns):
+            if n.name == name:
+                assert len(n.output) == 1
+                assert n.output[0] == output
+                n_gpu = onnx.helper.make_node(
+                    op_type=n.op_type,
+                    inputs=n.input,
+                    outputs=[output + '.gpu'],
+                    name=n.name + '_gpu',
+                    doc_string=n.doc_string,
+                    domain=n.domain,
+                    value=onnx.helper.get_attribute_value(n.attribute[0]),
+                )
+                ns.insert(i + 1, n_gpu)
+                print(n.name + '_gpu')
+                break
+
+    print("Replace Gather's second inputs with Constant's GPU versions...")
+    gathers_to_replace = [
+        'Gather_887',
+        'Gather_900',
+        'Gather_1417',
+        'Gather_1430',
+        'Gather_1947',
+        'Gather_1960',
+        'Gather_2477',
+        'Gather_2489',
+    ]
+    for n in ns:
+        if n.name in gathers_to_replace:
+            n.input[1] = n.input[1] + '.gpu'
+            print(n.input[1])
+
+
 def onnx_testdir_to_torchscript(test_dir: str) -> Tuple[torch._C.ScriptModule, List[Tuple[List[torch.Tensor], List[torch.Tensor]]]]:
     model_path = os.path.join(test_dir, "model.onnx")
     assert os.path.exists(model_path)
@@ -239,6 +285,9 @@ def onnx_testdir_to_torchscript(test_dir: str) -> Tuple[torch._C.ScriptModule, L
     cases = glob.glob(os.path.join(test_dir, "test_data_set_*"))
     ret: List[Tuple[List[torch.Tensor], List[torch.Tensor]]] = []
     m = onnx.load_model(model_path)
+
+    _tweak_onnx_model(m)
+
     for c in cases:
         input_files = glob.glob(os.path.join(c, "input_*.pb"))
         in_dict: Dict[str, torch.Tensor] = {}
